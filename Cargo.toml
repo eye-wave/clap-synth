@@ -1,0 +1,47 @@
+
+cargo-features = ["profile-rustflags"]
+
+[package]
+name = "clap_synth"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ash = "0.38"
+clack-plugin = "0.2"
+clack-extensions = { version = "0.2", features = [
+  "clack-plugin",
+  "gui",
+  "audio-ports",
+  "note-ports",
+  "params",
+  "state",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = ">=0.59, <=0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11 = { version = "2", features = ["xlib"] }
+
+[build-dependencies]
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true
+debug = false
+overflow-checks = false
+trim-paths = "all"
+rustflags = ["-Cdebuginfo=0", "-Zthreads=8"]

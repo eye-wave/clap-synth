@@ -1,5 +1,5 @@
 //! Platform-neutral GUI: owns the child window (see native.rs) and a render thread drawing a
-//! Vulkan (ash) box with the loaded waveform drawn in it. Dropping a .wav on the box is handled
+//! Vulkan (ash) box with the loaded waveform drawn in it. Dropping a .wav on the box, or clicking it to open a file picker, is handled
 //! by the native window (see native.rs).
 // ponytail: fixed 400x300 window, no resize/HiDPI, unwrap() instead of error handling inside the
 // render thread (a panic there only kills the GUI thread, never the audio thread).
@@ -109,8 +109,8 @@ impl PluginGuiImpl for Main<'_> {
 }
 
 /// Box half-size in NDC: 320x150 px in the middle of the 400x300 window.
-const BX: f32 = 0.8;
-const BY: f32 = 0.5;
+pub(crate) const BX: f32 = 0.8;
+pub(crate) const BY: f32 = 0.5;
 /// 4 outline segments + (MAX_WAVE - 1) waveform segments, 2 vertices each.
 const NV: usize = 8 + 2 * (MAX_WAVE - 1);
 

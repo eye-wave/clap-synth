@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::os::raw::c_long;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::thread::JoinHandle;
 use x11::xlib;
@@ -37,7 +38,7 @@ impl Native {
                 return Err(PluginError::Message("XOpenDisplay failed"));
             }
             let win = xlib::XCreateSimpleWindow(dnd, parent, 0, 0, W, H, 0, 0, 0);
-            xlib::XSelectInput(dnd, win, xlib::StructureNotifyMask); // for DestroyNotify
+            xlib::XSelectInput(dnd, win, xlib::StructureNotifyMask | xlib::ButtonPressMask); // DestroyNotify + clicks
             let aware = xlib::XInternAtom(dnd, c"XdndAware".as_ptr(), 0);
             let version: c_long = 5;
             xlib::XChangeProperty(
@@ -100,6 +101,25 @@ impl Drop for Native {
             xlib::XCloseDisplay(self.dpy as _);
         }
     }
+}
+
+/// Blocking file picker via whichever of zenity / kdialog is installed; None on cancel or neither.
+// ponytail: shells out instead of linking GTK / talking to the portal. Needs zenity or kdialog.
+fn pick() -> Option<PathBuf> {
+    for (cmd, args) in [
+        ("zenity", &["--file-selection", "--file-filter=*.wav"][..]),
+        ("kdialog", &["--getopenfilename", ".", "*.wav"][..]),
+    ] {
+        let Ok(o) = Command::new(cmd).args(args).output() else {
+            continue;
+        }; // not installed
+        let mut b = o.stdout;
+        while b.last() == Some(&b'\n') {
+            b.pop();
+        }
+        return (o.status.success() && !b.is_empty()).then(|| OsString::from_vec(b).into());
+    }
+    None
 }
 
 /// "file:///a%20b.wav\r\n..." -> the first path. Percent-decoded, host part dropped.
@@ -166,6 +186,15 @@ unsafe fn xdnd(dpy: *mut xlib::Display, win: xlib::Window, wave: &Wave) {
                     src = m.data.get_long(0) as xlib::Window;
                     let time = m.data.get_long(2) as xlib::Time;
                     xlib::XConvertSelection(dpy, selection, uri_list, prop, win, time);
+                }
+            }
+            xlib::ButtonPress => {
+                let b = e.button;
+                // runs on this thread, so drops are not serviced while the dialog is open
+                if b.button == 1 && in_box(b.x, b.y) {
+                    if let Some(path) = pick() {
+                        wave.load_file(&path);
+                    }
                 }
             }
             xlib::SelectionNotify => {

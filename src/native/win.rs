@@ -4,27 +4,60 @@ use std::os::windows::ffi::OsStringExt;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::*;
+use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub const API: GuiApiType<'static> = GuiApiType::WIN32;
 pub const EXTS: [&CStr; 2] = [khr::surface::NAME, khr::win32_surface::NAME];
 
+/// Modal open dialog filtered to .wav; None on cancel.
+// ponytail: 1024-unit path buffer; a longer path just makes the dialog refuse it.
+unsafe fn pick(owner: HWND) -> Option<std::ffi::OsString> {
+    let mut buf = [0u16; 1024];
+    let filter: Vec<u16> = "WAV\0*.wav\0\0".encode_utf16().collect();
+    let mut o: OPENFILENAMEW = std::mem::zeroed();
+    o.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    o.hwndOwner = owner;
+    o.lpstrFilter = filter.as_ptr();
+    o.lpstrFile = buf.as_mut_ptr();
+    o.nMaxFile = buf.len() as u32;
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if GetOpenFileNameW(&mut o) == 0 {
+        return None;
+    }
+    let n = buf.iter().position(|&c| c == 0)?;
+    Some(std::ffi::OsString::from_wide(&buf[..n]))
+}
+
 /// Runs on the host's UI thread. The window's user data holds an `Arc<Wave>` (see `new`/`drop`).
 unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if m != WM_DROPFILES {
-        return DefWindowProcW(h, m, w, l);
+    let wave = (GetWindowLongPtrW(h, GWLP_USERDATA) as *const Wave).as_ref();
+    match m {
+        WM_DROPFILES => {
+            let hd = w as HDROP;
+            if let Some(wave) = wave {
+                // only the first dropped file is looked at
+                let mut p = vec![0u16; DragQueryFileW(hd, 0, null_mut(), 0) as usize + 1];
+                let n = DragQueryFileW(hd, 0, p.as_mut_ptr(), p.len() as u32) as usize;
+                let path = std::ffi::OsString::from_wide(&p[..n]);
+                wave.load_file(path.as_ref());
+            }
+            DragFinish(hd);
+            0
+        }
+        WM_LBUTTONUP => {
+            if in_box(l as i16 as i32, (l >> 16) as i16 as i32) {
+                if let Some(wave) = wave {
+                    if let Some(path) = pick(h) {
+                        wave.load_file(path.as_ref());
+                    }
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(h, m, w, l),
     }
-    let hd = w as HDROP;
-    if let Some(wave) = (GetWindowLongPtrW(h, GWLP_USERDATA) as *const Wave).as_ref() {
-        // only the first dropped file is looked at
-        let mut p = vec![0u16; DragQueryFileW(hd, 0, null_mut(), 0) as usize + 1];
-        let n = DragQueryFileW(hd, 0, p.as_mut_ptr(), p.len() as u32) as usize;
-        let path = std::ffi::OsString::from_wide(&p[..n]);
-        wave.load_file(path.as_ref());
-    }
-    DragFinish(hd);
-    0
 }
 
 // Raw handles stored as usize so `Native` is Send + Sync (the render thread only needs the HWND).

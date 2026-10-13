@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::io::{Read, Write as _};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::Arc;
 
 // ---- parameters -------------------------------------------------------------------------------
 
@@ -33,37 +34,172 @@ const DEFS: [(&str, f32, f32, f32); 5] = [
     ("Voices", 1.0, MAX_VOICES as f32, 8.0),
 ];
 
+pub const MAX_WAVE: usize = 4096;
+
+/// The user's base waveform (f32 bits). Written by the GUI thread on file drop / state load, read by
+/// the audio and render threads. Relaxed atomics: a torn read while it is being replaced is one
+/// glitchy block at worst.
+pub struct Wave {
+    len: AtomicU32,
+    data: [AtomicU32; MAX_WAVE],
+}
+
+impl Wave {
+    pub fn new() -> Self {
+        Self {
+            len: AtomicU32::new(0),
+            data: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    #[allow(unused)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        (self.len.load(Relaxed) as usize).min(MAX_WAVE)
+    }
+
+    pub fn get(&self, i: usize) -> f32 {
+        f32::from_bits(self.data[i].load(Relaxed))
+    }
+
+    /// Samples first, length last. Anything past MAX_WAVE is ignored.
+    pub fn set(&self, s: &[f32]) {
+        for (a, v) in self.data.iter().zip(s) {
+            a.store(v.to_bits(), Relaxed);
+        }
+        self.len.store(s.len().min(MAX_WAVE) as u32, Relaxed);
+    }
+
+    /// Loads a dropped file. Unreadable, unsupported or too long: silently ignored, old wave kept.
+    pub fn load_file(&self, path: &std::path::Path) {
+        let mut b = Vec::new();
+        // a valid file is at most ~130 KB (4096 frames x 8 channels x 4 bytes); never slurp more than 1 MB
+        let _ = std::fs::File::open(path).and_then(|f| f.take(1 << 20).read_to_end(&mut b));
+        if let Some(s) = parse_wav(&b) {
+            self.set(&s);
+        }
+    }
+
+    /// Looping, linearly interpolated read at `phase` (0..1) over the whole waveform; None if empty.
+    fn read(&self, phase: f32) -> Option<f32> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        let x = phase * n as f32;
+        let i = x as usize;
+        let (a, b) = (self.get(i % n), self.get((i + 1) % n));
+        Some(a + (b - a) * x.fract())
+    }
+}
+
+impl Default for Wave {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Minimal RIFF/WAVE reader: first channel only, PCM 8/16/24/32-bit or f32. The sample rate is
+/// ignored on purpose. None if unsupported, empty, or longer than MAX_WAVE frames.
+pub fn parse_wav(b: &[u8]) -> Option<Vec<f32>> {
+    if b.get(..4)? != b"RIFF" || b.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let (mut fmt, mut data) = (None, None);
+    let mut i = 12;
+    while let Some(h) = b.get(i..i + 8) {
+        let n = u32::from_le_bytes(h[4..].try_into().ok()?) as usize;
+        let body = &b[i + 8..(i + 8).saturating_add(n).min(b.len())];
+        match &h[..4] {
+            b"fmt " => fmt = Some(body),
+            b"data" => data = Some(body),
+            _ => {}
+        }
+        i = (i + 8).saturating_add(n + (n & 1));
+    }
+    let (f, d) = (fmt?, data?);
+    let rd = |o: usize| Some(u16::from_le_bytes(f.get(o..o + 2)?.try_into().ok()?));
+    let (tag, ch, bits) = (rd(0)?, rd(2)? as usize, rd(14)? as usize);
+    let tag = if tag == 0xFFFE { rd(24)? } else { tag }; // WAVE_FORMAT_EXTENSIBLE: real tag is the subformat's
+    let n = bits / 8;
+    if ch == 0 || !(1..=4).contains(&n) || !matches!(tag, 1 | 3) {
+        return None;
+    }
+    let frames = d.len() / (ch * n);
+    if frames == 0 || frames > MAX_WAVE {
+        return None;
+    }
+    d.chunks_exact(ch * n)
+        .map(|fr| {
+            let s = &fr[..n];
+            Some(if tag == 3 {
+                f32::from_le_bytes(s.try_into().ok()?) // float must be 32-bit
+            } else {
+                // left-justify into an i32; 8-bit is unsigned, so flip its sign bit
+                let mut w = [0u8; 4];
+                w[4 - n..].copy_from_slice(s);
+                if n == 1 {
+                    w[3] ^= 0x80;
+                }
+                i32::from_le_bytes(w) as f32 / 2147483648.0
+            })
+        })
+        .collect()
+}
+
 /// Current param values as f32 bits. Shared between the main thread and the audio thread; the
 /// audio thread is the only writer while processing, so Relaxed atomics are enough.
-pub struct Params([AtomicU32; 5]);
+pub struct Params {
+    p: [AtomicU32; 5],
+    pub wave: Arc<Wave>,
+}
 
 impl Params {
     fn new() -> Self {
-        Self(DEFS.map(|d| AtomicU32::new(d.3.to_bits())))
+        Self {
+            p: DEFS.map(|d| AtomicU32::new(d.3.to_bits())),
+            wave: Arc::new(Wave::new()),
+        }
     }
 
     fn get(&self, i: usize) -> f32 {
-        f32::from_bits(self.0[i].load(Relaxed))
+        f32::from_bits(self.p[i].load(Relaxed))
     }
 
     fn set(&self, i: usize, v: f32) {
         if let Some(&(_, lo, hi, _)) = DEFS.get(i) {
             let v = if i == VOICES { v.round() } else { v };
-            self.0[i].store(v.clamp(lo, hi).to_bits(), Relaxed);
+            self.p[i].store(v.clamp(lo, hi).to_bits(), Relaxed);
         }
     }
 
-    /// State format: the 5 values as little-endian f32, in param id order.
+    /// State format: the 5 params as little-endian f32 in id order, then the waveform as a u32
+    /// length followed by that many f32 samples. Old saves (params only) just leave the wave alone.
     fn to_bytes(&self) -> Vec<u8> {
+        let (w, n) = (&self.wave, self.wave.len());
         (0..DEFS.len())
             .flat_map(|i| self.get(i).to_le_bytes())
+            .chain((n as u32).to_le_bytes())
+            .chain((0..n).flat_map(|i| w.get(i).to_le_bytes()))
             .collect()
     }
 
     fn load_bytes(&self, b: &[u8]) {
         // ponytail: no version tag. Add one the day the layout changes (old saves just load by index).
-        for (i, c) in b.as_chunks::<4>().0.iter().take(DEFS.len()).enumerate() {
+        let c = b.as_chunks::<4>().0;
+        for (i, c) in c.iter().take(DEFS.len()).enumerate() {
             self.set(i, f32::from_le_bytes(*c));
+        }
+        if let Some((n, s)) = c.get(DEFS.len()..).and_then(|r| r.split_first()) {
+            let s: Vec<f32> = s
+                .iter()
+                .take(u32::from_le_bytes(*n) as usize)
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            self.wave.set(&s);
         }
     }
 
@@ -267,9 +403,10 @@ const IDLE: Voice = Voice {
     age: 0,
 };
 
-/// Polyphonic saw synth with a linear ADSR per voice. Plain Copy data: process() renders each
+/// Polyphonic synth with a linear ADSR per voice. Each voice loops the user's waveform as one cycle
+/// at the note's frequency (that is the resampling); a saw plays until a waveform is loaded. Plain Copy data: process() renders each
 /// output channel from a copy of the same starting state, which keeps channels identical.
-// ponytail: naive (aliased) saw, linear envelope, block-accurate note events, oldest-voice
+// ponytail: naive (aliased, no filtering) oscillator, linear envelope, block-accurate note events, oldest-voice
 // stealing. polyBLEP / exponential curves / sample-accurate events if it matters.
 #[derive(Clone, Copy)]
 pub struct Engine {
@@ -333,7 +470,7 @@ impl Engine {
         self.voices.iter().filter(|v| v.stage != Stage::Off).count()
     }
 
-    pub fn next_sample(&mut self) -> f32 {
+    pub fn next_sample(&mut self, wave: &Wave) -> f32 {
         let [a, d, s, _] = self.adsr;
         let mut out = 0.0;
         for v in &mut self.voices {
@@ -361,7 +498,7 @@ impl Engine {
                 }
             }
             v.phase = (v.phase + v.freq / self.sr).fract();
-            out += (v.phase * 2.0 - 1.0) * v.level;
+            out += wave.read(v.phase).unwrap_or(v.phase * 2.0 - 1.0) * v.level;
         }
         out * 0.3 / (self.n as f32).sqrt() // headroom that shrinks with polyphony
     }
@@ -419,7 +556,7 @@ impl<'a> PluginAudioProcessor<'a, Params, Main<'a>> for Processor<'a> {
                 if let ChannelPair::OutputOnly(buf) = ch {
                     let mut e = start; // every channel renders the same mono signal
                     for s in buf {
-                        *s = e.next_sample();
+                        *s = e.next_sample(&self.params.wave);
                     }
                     end = e;
                 }
@@ -450,18 +587,18 @@ mod tests {
 
     #[test]
     fn adsr_attacks_sustains_then_releases_to_silence() {
-        let mut e = engine();
-        assert_eq!(e.next_sample(), 0.0);
+        let (mut e, w) = (engine(), Wave::new());
+        assert_eq!(e.next_sample(&w), 0.0);
         e.note_on(69);
         let peak = (0..48000)
-            .map(|_| e.next_sample().abs())
+            .map(|_| e.next_sample(&w).abs())
             .fold(0.0, f32::max);
         assert!(peak > 0.05 && peak < 0.3, "peak {peak}");
         assert_eq!(e.voices[0].stage, Stage::Sustain);
         e.note_off(69);
-        (0..48000).for_each(|_| _ = e.next_sample()); // release is 0.3 s
+        (0..48000).for_each(|_| _ = e.next_sample(&w)); // release is 0.3 s
         assert_eq!(e.active(), 0);
-        assert_eq!(e.next_sample(), 0.0);
+        assert_eq!(e.next_sample(&w), 0.0);
     }
 
     #[test]
@@ -470,6 +607,7 @@ mod tests {
         p.set(VOICES, 2.0);
         let mut e = Engine::new(48000.0);
         e.load(&p);
+        let w = Wave::new();
         [60, 64, 67].iter().for_each(|&k| e.note_on(k));
         assert_eq!(e.active(), 2);
         // the oldest (60) was stolen, 64 and 67 remain
@@ -477,7 +615,7 @@ mod tests {
         // lowering the limit fades the extra voices out
         p.set(VOICES, 1.0);
         e.load(&p);
-        (0..48000).for_each(|_| _ = e.next_sample());
+        (0..48000).for_each(|_| _ = e.next_sample(&w));
         assert_eq!(e.active(), 1);
     }
 
@@ -503,5 +641,60 @@ mod tests {
         p.set(SUSTAIN, -1.0);
         assert_eq!(p.get(SUSTAIN), 0.0);
         p.set(42, 1.0); // unknown id is ignored
+    }
+
+    fn wav(tag: u16, bits: u16, ch: u16, data: &[u8]) -> Vec<u8> {
+        let mut v = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        v.extend(16u32.to_le_bytes());
+        v.extend(tag.to_le_bytes());
+        v.extend(ch.to_le_bytes());
+        v.extend([0; 8]); // sample rate + byte rate: never read
+        v.extend((ch * bits / 8).to_le_bytes());
+        v.extend(bits.to_le_bytes());
+        v.extend(*b"data");
+        v.extend((data.len() as u32).to_le_bytes());
+        v.extend(data);
+        v
+    }
+
+    #[test]
+    fn wav_parses_first_channel_and_rejects_too_long() {
+        // stereo 16-bit, 2 frames: the right channel is ignored
+        let d: Vec<u8> = [16384i16, -1, -32768, 5]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        assert_eq!(parse_wav(&wav(1, 16, 2, &d)), Some(vec![0.5, -1.0]));
+        assert_eq!(
+            parse_wav(&wav(1, 8, 1, &[128, 255])),
+            Some(vec![0.0, 127.0 / 128.0])
+        );
+        assert_eq!(
+            parse_wav(&wav(3, 32, 1, &0.25f32.to_le_bytes())),
+            Some(vec![0.25])
+        );
+        assert!(parse_wav(&wav(1, 16, 1, &vec![0; 2 * MAX_WAVE])).is_some());
+        assert!(parse_wav(&wav(1, 16, 1, &vec![0; 2 * MAX_WAVE + 2])).is_none());
+        assert!(parse_wav(&wav(1, 16, 1, &[])).is_none());
+        assert!(parse_wav(b"nope").is_none());
+    }
+
+    #[test]
+    fn wave_roundtrips_in_state_and_is_played() {
+        let (a, b) = (Params::new(), Params::new());
+        a.wave.set(&[0.5, 0.5, 0.5, 0.5]);
+        b.load_bytes(&a.to_bytes());
+        assert_eq!(b.wave.len(), 4);
+        assert_eq!(b.wave.get(3), 0.5);
+        b.load_bytes(&a.to_bytes()[..DEFS.len() * 4 + 8]); // truncated wave: shorter, no panic
+        assert_eq!(b.wave.len(), 1);
+        // a constant waveform plays as a constant, scaled by the envelope
+        let mut e = Engine::new(48000.0);
+        e.load(&a);
+        e.note_on(69);
+        let peak = (0..48000)
+            .map(|_| e.next_sample(&a.wave).abs())
+            .fold(0.0, f32::max);
+        assert!(peak > 0.04 && peak < 0.15, "peak {peak}");
     }
 }

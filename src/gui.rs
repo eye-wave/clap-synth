@@ -1,9 +1,10 @@
 //! Platform-neutral GUI: owns the child window (see native.rs) and a render thread drawing a
-//! Vulkan (ash) triangle into it.
+//! Vulkan (ash) box with the loaded waveform drawn in it. Dropping a .wav on the box is handled
+//! by the native window (see native.rs).
 // ponytail: fixed 400x300 window, no resize/HiDPI, unwrap() instead of error handling inside the
 // render thread (a panic there only kills the GUI thread, never the audio thread).
 use crate::native::{Native, API, EXTS, H, W};
-use crate::Main;
+use crate::{Main, Wave, MAX_WAVE};
 use ash::{khr, vk, Entry};
 use clack_extensions::gui::*;
 use clack_plugin::prelude::*;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-const SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tri.spv"));
+const SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wave.spv"));
 
 pub struct Open {
     native: Arc<Native>,
@@ -71,7 +72,7 @@ impl PluginGuiImpl for Main<'_> {
     fn set_parent(&self, window: Window) -> Result<(), PluginError> {
         self.destroy();
         *self.gui.borrow_mut() = Some(Open {
-            native: Arc::new(Native::new(&window)?),
+            native: Arc::new(Native::new(&window, self.params.wave.clone())?),
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
         });
@@ -90,9 +91,9 @@ impl PluginGuiImpl for Main<'_> {
         o.native.show()?;
         if o.thread.is_none() {
             o.stop.store(false, Relaxed);
-            let (native, stop) = (o.native.clone(), o.stop.clone());
+            let (native, stop, wave) = (o.native.clone(), o.stop.clone(), self.params.wave.clone());
             o.thread = Some(std::thread::spawn(move || unsafe {
-                render(&native, &stop)
+                render(&native, &stop, &wave)
             }));
         }
         Ok(())
@@ -107,10 +108,40 @@ impl PluginGuiImpl for Main<'_> {
     }
 }
 
-/// Vulkan setup + render loop. Command buffers are recorded once (the triangle never changes);
-/// each frame is acquire -> submit -> present -> queue_wait_idle.
-// ponytail: queue_wait_idle per frame instead of frames-in-flight. Add fences when the scene animates.
-unsafe fn render(native: &Native, stop: &AtomicBool) {
+/// Box half-size in NDC: 320x150 px in the middle of the 400x300 window.
+const BX: f32 = 0.8;
+const BY: f32 = 0.5;
+/// 4 outline segments + (MAX_WAVE - 1) waveform segments, 2 vertices each.
+const NV: usize = 8 + 2 * (MAX_WAVE - 1);
+
+/// Rewrites the whole vertex buffer: box outline, then the waveform as a LINE_LIST. Always the
+/// same vertex count, so the command buffers never need re-recording: points past the end of a
+/// short waveform repeat the last one (zero-length segments), an empty wave is a flat line.
+fn fill(v: &mut [[f32; 2]], wave: &Wave) {
+    let c = [[-BX, -BY], [BX, -BY], [BX, BY], [-BX, BY]];
+    for i in 0..4 {
+        (v[2 * i], v[2 * i + 1]) = (c[i], c[(i + 1) % 4]);
+    }
+    let n = wave.len();
+    let pt = |k: usize| {
+        let (x, y) = if n == 0 {
+            (k as f32 / (MAX_WAVE - 1) as f32, 0.0)
+        } else {
+            let j = k.min(n - 1);
+            (j as f32 / (n - 1).max(1) as f32, wave.get(j))
+        };
+        [BX * (2.0 * x - 1.0), -BY * 0.9 * y.clamp(-1.0, 1.0)] // Vulkan NDC y points down
+    };
+    for k in 0..MAX_WAVE - 1 {
+        (v[8 + 2 * k], v[9 + 2 * k]) = (pt(k), pt(k + 1));
+    }
+}
+
+/// Vulkan setup + render loop. Command buffers are recorded once; each frame refills the
+/// host-coherent vertex buffer, then acquire -> submit -> present -> queue_wait_idle.
+// ponytail: queue_wait_idle per frame instead of frames-in-flight (so rewriting the buffer at the
+// top of the next frame is safe), and the buffer is refilled every frame rather than on change.
+unsafe fn render(native: &Native, stop: &AtomicBool, wave: &Wave) {
     let entry = Entry::load().unwrap();
     let exts = EXTS.map(|e| e.as_ptr());
     let inst = entry
@@ -188,6 +219,41 @@ unsafe fn render(native: &Native, stop: &AtomicBool) {
         .unwrap();
     let images = sc_d.get_swapchain_images(sc).unwrap();
 
+    // vertex buffer, persistently mapped
+    let vb = dev
+        .create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size((NV * 8) as u64)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+        .unwrap();
+    let req = dev.get_buffer_memory_requirements(vb);
+    let mp = inst.get_physical_device_memory_properties(pd);
+    let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let mem = dev
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(
+                    (0..mp.memory_type_count)
+                        .find(|&i| {
+                            req.memory_type_bits & (1 << i) != 0
+                                && mp.memory_types[i as usize].property_flags.contains(want)
+                        })
+                        .unwrap(),
+                ),
+            None,
+        )
+        .unwrap();
+    dev.bind_buffer_memory(vb, mem, 0).unwrap();
+    let verts = std::slice::from_raw_parts_mut(
+        dev.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            .unwrap() as *mut [f32; 2],
+        NV,
+    );
+
     // render pass
     let attach = [vk::AttachmentDescription::default()
         .format(fmt.format)
@@ -253,10 +319,20 @@ unsafe fn render(native: &Native, stop: &AtomicBool) {
             vk::PipelineCache::null(),
             &[vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages)
-                .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                .vertex_input_state(
+                    &vk::PipelineVertexInputStateCreateInfo::default()
+                        .vertex_binding_descriptions(&[vk::VertexInputBindingDescription::default(
+                        )
+                        .stride(8)
+                        .input_rate(vk::VertexInputRate::VERTEX)])
+                        .vertex_attribute_descriptions(&[
+                            vk::VertexInputAttributeDescription::default()
+                                .format(vk::Format::R32G32_SFLOAT),
+                        ]),
+                )
                 .input_assembly_state(
                     &vk::PipelineInputAssemblyStateCreateInfo::default()
-                        .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+                        .topology(vk::PrimitiveTopology::LINE_LIST),
                 )
                 .viewport_state(
                     &vk::PipelineViewportStateCreateInfo::default()
@@ -344,7 +420,8 @@ unsafe fn render(native: &Native, stop: &AtomicBool) {
             vk::SubpassContents::INLINE,
         );
         dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipe);
-        dev.cmd_draw(cmd, 3, 1, 0, 0);
+        dev.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
+        dev.cmd_draw(cmd, NV as u32, 1, 0, 0);
         dev.cmd_end_render_pass(cmd);
         dev.end_command_buffer(cmd).unwrap();
         views.push(view);
@@ -359,6 +436,7 @@ unsafe fn render(native: &Native, stop: &AtomicBool) {
         .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
         .unwrap();
     while !stop.load(Relaxed) {
+        fill(verts, wave);
         if let Ok((i, _)) = sc_d.acquire_next_image(sc, u64::MAX, acquire, vk::Fence::null()) {
             dev.queue_submit(
                 queue,
@@ -392,6 +470,8 @@ unsafe fn render(native: &Native, stop: &AtomicBool) {
     views
         .into_iter()
         .for_each(|v| dev.destroy_image_view(v, None));
+    dev.destroy_buffer(vb, None);
+    dev.free_memory(mem, None); // also unmaps
     dev.destroy_pipeline(pipe, None);
     dev.destroy_pipeline_layout(layout, None);
     dev.destroy_shader_module(module, None);
